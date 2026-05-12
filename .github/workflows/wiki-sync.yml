@@ -1,0 +1,172 @@
+name: Wiki sync
+
+# Mirror docs/ → GitHub Wiki on every push to main. The /docs/
+# markdown stays the source of truth; the Wiki is a read-only
+# mirror so people who land on the Wiki tab get the same content
+# without having to navigate the docs/ tree.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/wiki-sync.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Mirror docs/ to GitHub Wiki
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Clone the wiki repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          wiki_remote="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.wiki.git"
+          if ! git clone "$wiki_remote" wiki-checkout 2>/dev/null; then
+            echo "::warning::Wiki repo does not exist yet."
+            echo "Open https://github.com/${{ github.repository }}/wiki and create the first page (any content)"
+            echo "to initialise the wiki repo, then re-run this workflow."
+            exit 0
+          fi
+
+      - name: Render docs/ into the wiki checkout
+        if: hashFiles('wiki-checkout/.git/config') != ''
+        run: |
+          set -euo pipefail
+
+          src=docs
+          dst=wiki-checkout
+
+          # Wipe everything except .git so deletions in docs/ propagate.
+          find "$dst" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+
+          # Map docs/<section>/<page>.md  →  wiki-checkout/<Page-Title>.md
+          # Map docs/index.md            →  wiki-checkout/Home.md
+          # Keep _Sidebar.md at the root.
+          python3 - <<'PY'
+          import os, re, shutil
+
+          src = "docs"
+          dst = "wiki-checkout"
+
+          # Full relative path → wiki page name. The Wiki is a flat
+          # namespace, so we encode section + page into the page name.
+          path_map = {
+              "index.md":                              "Home.md",
+              "_Sidebar.md":                           "_Sidebar.md",
+
+              "getting-started/install.md":            "Install.md",
+              "getting-started/permissions.md":        "Permissions.md",
+              "getting-started/storage.md":            "Storage.md",
+
+              "commands/index.md":                     "Command-index.md",
+              "commands/admin.md":                     "Admin-commands.md",
+              "commands/player.md":                    "Player-commands.md",
+
+              "config/config-yml.md":                  "Config-yml.md",
+              "config/events-yml.md":                  "Events-yml.md",
+              "config/gui-yml.md":                     "Gui-yml.md",
+              "config/sellwands.md":                   "Sellwands.md",
+              "config/lang.md":                        "Localization.md",
+
+              "generators/overview.md":                "Generator-overview.md",
+              "generators/premade-chains.md":          "Premade-tier-chains.md",
+              "generators/custom-tiers.md":            "Custom-tiers.md",
+              "generators/drops-registry.md":          "Drops-registry.md",
+              "generators/balance-guide.md":           "Balance-guide.md",
+
+              "integrations/vault.md":                 "Vault.md",
+              "integrations/placeholderapi.md":        "PlaceholderAPI.md",
+              "integrations/holograms.md":             "Holograms.md",
+              "integrations/protections.md":           "Protections.md",
+
+              "operations/backup.md":                  "Backups.md",
+              "operations/performance.md":             "Performance.md",
+              "operations/metrics.md":                 "Metrics.md",
+              "operations/troubleshooting.md":         "Troubleshooting.md",
+              "operations/faq.md":                     "FAQ.md",
+          }
+
+          # Build a reverse lookup from "every plausible relative
+          # link spelling" → wiki page name, so we can rewrite
+          # `(install.md)`, `(../getting-started/install.md)`,
+          # `(./install.md)` all to `(Install)`.
+          page_by_basename = {}
+          page_by_full = {}
+          for rel, page in path_map.items():
+              wiki = page[:-3] if page.endswith(".md") else page
+              page_by_full[rel] = wiki
+              page_by_basename[os.path.basename(rel)] = wiki
+
+          link_re = re.compile(r'\]\(([^)\s]+\.md)(#[^)\s]*)?\)')
+
+          def rewrite(content: str, source_rel: str) -> str:
+              source_dir = os.path.dirname(source_rel)
+
+              def replace(match):
+                  target_path = match.group(1)
+                  anchor = match.group(2) or ""
+                  # Skip absolute URLs.
+                  if "://" in target_path:
+                      return match.group(0)
+                  # Resolve relative to the source file's directory.
+                  resolved = os.path.normpath(os.path.join(source_dir, target_path)).replace("\\", "/")
+                  wiki = page_by_full.get(resolved) or page_by_basename.get(os.path.basename(target_path))
+                  if not wiki:
+                      return match.group(0)
+                  return f"]({wiki}{anchor})"
+
+              return link_re.sub(replace, content)
+
+          missing = []
+          for dirpath, _, filenames in os.walk(src):
+              for name in filenames:
+                  if not name.endswith(".md"):
+                      continue
+                  rel = os.path.relpath(os.path.join(dirpath, name), src).replace("\\", "/")
+                  out_name = path_map.get(rel)
+                  if not out_name:
+                      missing.append(rel)
+                      continue
+                  with open(os.path.join(dirpath, name), encoding="utf-8") as f:
+                      body = f.read()
+                  body = rewrite(body, rel)
+                  with open(os.path.join(dst, out_name), "w", encoding="utf-8") as f:
+                      f.write(body)
+                  print(f"copied {rel} -> {out_name}")
+
+          if missing:
+              print("WARNING: no wiki-path mapping for:")
+              for m in missing:
+                  print(f"  {m}")
+              print("Add an entry to path_map in .github/workflows/wiki-sync.yml.")
+          PY
+
+      - name: Commit + push to wiki
+        if: hashFiles('wiki-checkout/.git/config') != ''
+        run: |
+          set -euo pipefail
+          cd wiki-checkout
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Wiki already in sync — nothing to commit."
+            exit 0
+          fi
+          git add -A
+          git commit -m "Sync from ${{ github.sha }}"
+          git push origin HEAD:master
